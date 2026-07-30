@@ -38,6 +38,7 @@ databricks = [
     "ibis-framework[databricks]>=10.5.0",
     "databricks-sql-connector>=3.0.0",
 ]
+bigquery = ["ibis-framework[bigquery]>=10.5.0"]
 
 [build-system]
 requires = ["hatchling"]

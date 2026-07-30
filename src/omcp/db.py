@@ -62,16 +62,20 @@ class OmopDatabase:
             "duckdb",
             "postgres",
             "databricks",
+            "bigquery",
             # 'mssql',
             # 'mysql',
             # 'sqlite',
             # 'clickhouse',
-            # 'bigquery',
             # 'snowflake',
             # 'impala',
             # 'oracle'
         ]
         self.connection_string = connection_string
+        parsed_connection = urlparse(connection_string)
+        self.bigquery_project = (
+            parsed_connection.netloc if connection_string.startswith("bigquery://") else None
+        )
         self.read_only = read_only
         self.row_limit = 1000  # Default row limit for queries
         self.allowed_tables = allowed_tables or [
@@ -101,7 +105,7 @@ class OmopDatabase:
             # "note",
             # "note_nlp",
             "observation",
-            # "observation_period",
+            "observation_period",
             # "payer_plan_period",
             "person",
             "procedure_occurrence",
@@ -115,18 +119,19 @@ class OmopDatabase:
 
         self.allow_source_value_columns: bool = allow_source_value_columns
 
+        # Determine the target dialect before configuring SQL validation.
+        self.target_dialect = self._get_dialect_from_connection_string(
+            connection_string
+        )
+
         self.sql_validator = SQLValidator(
             allow_source_value_columns=self.allow_source_value_columns,
             exclude_tables=None,
             exclude_columns=None,
+            from_dialect=self.target_dialect,
         )
         self.cdm_schema = cdm_schema
         self.vocab_schema = vocab_schema
-
-        # Determine database dialect from connection string
-        self.target_dialect = self._get_dialect_from_connection_string(
-            connection_string
-        )
 
         # Try initial connection
         logger.info(f"Initializing connection to: {connection_string}")
@@ -158,6 +163,8 @@ class OmopDatabase:
             return "postgres"
         elif connection_string.startswith("duckdb://"):
             return "duckdb"
+        elif connection_string.startswith("bigquery://"):
+            return "bigquery"
         else:
             # Default to postgres for unknown dialects
             logger.warning(
@@ -298,12 +305,24 @@ class OmopDatabase:
         try:
             with self._conn_lock:
                 at = ",".join(f"'{i}'" for i in self.allowed_tables)
-                query = f"""
-                select table_schema, table_name, column_name,data_type
-                from information_schema.columns
-                where table_name in ({at})
-                and table_schema in ('{self.cdm_schema}', '{self.vocab_schema}')
-                """
+                if self.target_dialect == "bigquery":
+                    schemas = tuple(dict.fromkeys((self.cdm_schema, self.vocab_schema)))
+                    schema_queries = [
+                        f"""
+                        select table_schema, table_name, column_name, data_type
+                        from `{self.bigquery_project}.{schema}.INFORMATION_SCHEMA.COLUMNS`
+                        where table_name in ({at})
+                        """
+                        for schema in schemas
+                    ]
+                    query = " union all ".join(schema_queries)
+                else:
+                    query = f"""
+                    select table_schema, table_name, column_name,data_type
+                    from information_schema.columns
+                    where table_name in ({at})
+                    and table_schema in ('{self.cdm_schema}', '{self.vocab_schema}')
+                    """
                 # Add filtering for source_value columns if not allowed
                 if not self.allow_source_value_columns:
                     query += " and lower(column_name) not like '%_source_value%'"
@@ -319,7 +338,12 @@ class OmopDatabase:
             raise ex.QueryError(f"Failed to get information schema: {str(e)}")
 
     @lru_cache(maxsize=128)
-    def read_query(self, query: str) -> str:
+    def read_query(
+        self,
+        query: str,
+        allow_source_value_columns: bool = False,
+        source_dialect: str = "postgres",
+    ) -> str:
         """
         Execute a read-only SQL query and return results as CSV
 
@@ -332,7 +356,15 @@ class OmopDatabase:
 
         try:
             # Validate the SQL query first (no DB connection needed)
-            errors = self.sql_validator.validate_sql(query)
+            validator = self.sql_validator
+            if allow_source_value_columns and not self.allow_source_value_columns:
+                validator = SQLValidator(
+                    allow_source_value_columns=True,
+                    exclude_tables=self.sql_validator.exclude_tables,
+                    exclude_columns=self.sql_validator.exclude_columns,
+                    from_dialect=self.target_dialect,
+                )
+            errors = validator.validate_sql(query)
 
             # DoNotDelete: Adding message and exceptions keywords to the exception group
             # results in `TypeError: BaseExceptionGroup.__new__() takes exactly 2 arguments (0 given)`
@@ -344,7 +376,6 @@ class OmopDatabase:
 
             # Transpile query if needed (postgres -> databricks, etc.)
             # We assume Claude generates queries in postgres dialect by default
-            source_dialect = "postgres"
             transpiled_query = query
 
             if self.target_dialect != source_dialect:

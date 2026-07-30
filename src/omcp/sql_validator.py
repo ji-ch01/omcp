@@ -68,6 +68,7 @@ class SQLValidator:
         """
 
         self.allow_source_value_columns: bool = allow_source_value_columns
+        self.from_dialect = from_dialect
         self.exclude_tables: t.List = (
             list(map(str.lower, exclude_tables)) if exclude_tables is not None else []
         )
@@ -221,7 +222,7 @@ class SQLValidator:
 
         try:
             # Parse the SQL query
-            parsed_sql = sg.parse_one(sql)
+            parsed_sql = sg.parse_one(sql, read=self.from_dialect)
 
             # Validate the query to ensure it's a SELECT statement
 

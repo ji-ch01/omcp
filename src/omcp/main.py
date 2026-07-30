@@ -307,9 +307,16 @@ elif db_type == "databricks":
         f"&schema={quote_plus(db_schema)}"
     )
     logger.info(f"Using Databricks with catalog={db_catalog}, schema={db_schema}")
+elif db_type == "bigquery":
+    db_project = os.environ.get("DB_PROJECT")
+    db_dataset = os.environ.get("DB_DATASET")
+    if not db_project or not db_dataset:
+        raise ValueError("DB_PROJECT and DB_DATASET are required for BigQuery")
+    connection_string = f"bigquery://{db_project}/{db_dataset}"
+    logger.info(f"Using BigQuery project={db_project}, dataset={db_dataset}")
 else:
     raise ValueError(
-        "Unsupported DB_TYPE. Must be 'duckdb', 'postgres', or 'databricks'."
+        "Unsupported DB_TYPE. Must be 'duckdb', 'postgres', 'databricks', or 'bigquery'."
     )
 
 logger.info(f"Initializing OMCP server with {db_type} database...")
@@ -333,8 +340,12 @@ mcp_app = FastMCP(name="OMOP MCP Server")
 try:
     db = OmopDatabase(
         connection_string=connection_string,
-        cdm_schema=os.environ.get("CDM_SCHEMA", "base"),
-        vocab_schema=os.environ.get("VOCAB_SCHEMA", "base"),
+        cdm_schema=os.environ.get(
+            "CDM_SCHEMA", db_dataset if db_type == "bigquery" else "base"
+        ),
+        vocab_schema=os.environ.get(
+            "VOCAB_SCHEMA", db_dataset if db_type == "bigquery" else "base"
+        ),
         read_only=db_read_only,
     )
     logger.info(f"Database initialized successfully (read-only: {db_read_only})")
