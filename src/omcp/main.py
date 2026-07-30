@@ -10,8 +10,22 @@ from omcp.trace_context import read_trace_context
 import uuid
 import time
 import traceback
+import hashlib
 from functools import wraps
 from urllib.parse import quote_plus
+from typing import Any
+
+from omcp.governance import (
+    CAUSAL_OPERATIONS,
+    CausalExecutionContext,
+    authorize_causal_operation,
+)
+from omcp.concept_lookup import (
+    build_concepts_by_id_sql,
+    build_lookup_concept_sql,
+    build_lookup_condition_sql,
+    build_lookup_drug_sql,
+)
 
 # OpenTelemetry context propagation
 from opentelemetry.propagate import extract
@@ -424,7 +438,6 @@ def read_query(query: str) -> mcp.types.CallToolResult:
                 mcp.types.TextContent(type="text", text=result),
             ]
         )
-
     except ExceptionGroup as e:
         logger.error(f"Query validation failed: {e}")
         errors = "\n\n".join(str(i) for i in e.exceptions)
@@ -451,38 +464,99 @@ def read_query(query: str) -> mcp.types.CallToolResult:
 
 
 @mcp_app.tool(
+    name="Get_Capabilities",
+    description="Describe descriptive and governed causal capabilities exposed by OMCP.",
+)
+def get_capabilities() -> dict[str, Any]:
+    return {
+        "server": "omcp",
+        "database_type": db.target_dialect,
+        "descriptive_tools": [
+            "Get_Information_Schema",
+            "Select_Query",
+            "Lookup_Drug",
+            "Lookup_Condition",
+            "Lookup_Concept",
+            "Get_Concepts_By_Id",
+        ],
+        "causal_tools": ["Causal_Select_Query"],
+        "causal_operations": list(CAUSAL_OPERATIONS),
+        "causal_context_required": True,
+        "read_only": db.read_only,
+    }
+
+
+@mcp_app.tool(
+    name="Causal_Select_Query",
+    description=(
+        "Execute a governed read-only OMOP query for a causal workflow. "
+        "Requires a CausalOMOP execution-readiness context and operation type."
+    ),
+)
+@capture_context(tool_name="Causal_Select_Query")
+def causal_read_query(
+    query: str,
+    operation: str,
+    causal_context: dict[str, Any],
+) -> mcp.types.CallToolResult:
+    """Execute only when the orchestrator readiness snapshot authorizes it."""
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    try:
+        context = CausalExecutionContext.from_mapping(causal_context)
+        authorize_causal_operation(operation, context)
+        result = db.read_query(
+            query,
+            allow_source_value_columns=(
+                operation == "aggregate_feasibility" and context.mode == "exploratory"
+            ),
+            source_dialect=db.target_dialect,
+        )
+        return mcp.types.CallToolResult(
+            content=[mcp.types.TextContent(type="text", text=result)],
+            _meta={
+                "run_id": context.run_id,
+                "study_id": context.study_id,
+                "operation": operation,
+                "query_sha256": query_hash,
+                "causal_estimation_allowed": context.causal_estimation_allowed,
+            },
+        )
+    except Exception as error:
+        logger.error("Governed causal query rejected: %s", error)
+        return mcp.types.CallToolResult(
+            isError=True,
+            content=[
+                mcp.types.TextContent(
+                    type="text", text=f"Governed causal query rejected: {error}"
+                )
+            ],
+            _meta={"operation": operation, "query_sha256": query_hash},
+        )
+
+@mcp_app.tool(
     name="Lookup_Drug",
-    description="Look up drug concepts by name in the OMOP concept table. Returns standardized drug concepts with concept_id, concept_name, concept_code, vocabulary_id, and domain_id. Only searches standard RxNorm vocabulary.",
+    description="Look up drug concepts by name (or synonym) in the OMOP concept table. Returns standardized drug concepts with concept_id, concept_name, concept_code, vocabulary_id, and domain_id. Only searches standard RxNorm vocabulary.",
 )
 @capture_context(tool_name="Lookup_Drug")
-def lookup_drug(term: str, limit: int = 10) -> mcp.types.CallToolResult:
+def lookup_drug(term: str, limit: int = 10, offset: int = 0) -> mcp.types.CallToolResult:
     """Look up drug concepts by name.
 
-    This function searches for drug concepts in the OMOP concept table by partial name match.
-    Only returns standard, valid drug concepts from RxNorm vocabulary, ordered by name length (shortest first).
-    Excludes non-standard vocabularies like RxNorm Extension to ensure compatibility.
+    This function searches for drug concepts in the OMOP concept table by partial match on
+    the concept's own name or any of its concept_synonym entries (abbreviations, alternate
+    names). Only returns standard, valid drug concepts from RxNorm vocabulary, ordered by
+    name length (shortest first). Excludes non-standard vocabularies like RxNorm Extension
+    to ensure compatibility.
 
     Args:
-        term: Drug name to search for (case-insensitive partial match)
+        term: Drug name to search for (case-insensitive partial match, name or synonym)
         limit: Maximum number of results to return (default: 10)
+        offset: Number of matching results to skip, for paging past the first `limit` (default: 0)
 
     Returns:
         CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id, domain_id
     """
     try:
-        schema = db.cdm_schema
-        # Filter to RxNorm vocabulary only - excludes RxNorm Extension and other non-standard vocabularies
-        query = f"""
-        SELECT concept_id, concept_name, concept_code, vocabulary_id, domain_id
-        FROM {schema}.concept
-        WHERE LOWER(concept_name) LIKE LOWER('%{term}%')
-          AND domain_id = 'Drug'
-          AND vocabulary_id = 'RxNorm'
-          AND standard_concept = 'S'
-          AND invalid_reason IS NULL
-        ORDER BY LENGTH(concept_name), concept_name
-        LIMIT {limit}
-        """
+        query = build_lookup_drug_sql(db.cdm_schema, term, limit, offset)
         logger.info(f"Looking up drug: {term}")
         result = db.read_query(query)
         logger.info(f"Drug lookup completed for: {term}")
@@ -503,37 +577,27 @@ def lookup_drug(term: str, limit: int = 10) -> mcp.types.CallToolResult:
 
 @mcp_app.tool(
     name="Lookup_Condition",
-    description="Look up condition concepts by name in the OMOP concept table. Returns standardized condition concepts with concept_id, concept_name, concept_code, vocabulary_id, and domain_id. Only searches standard SNOMED vocabulary.",
+    description="Look up condition concepts by name (or synonym) in the OMOP concept table. Returns standardized condition concepts with concept_id, concept_name, concept_code, vocabulary_id, and domain_id. Only searches standard SNOMED vocabulary.",
 )
 @capture_context(tool_name="Lookup_Condition")
-def lookup_condition(term: str, limit: int = 10) -> mcp.types.CallToolResult:
+def lookup_condition(term: str, limit: int = 10, offset: int = 0) -> mcp.types.CallToolResult:
     """Look up condition concepts by name.
 
-    This function searches for condition concepts in the OMOP concept table by partial name match.
-    Only returns standard, valid condition concepts from SNOMED vocabulary, ordered by name length (shortest first).
+    This function searches for condition concepts in the OMOP concept table by partial match
+    on the concept's own name or any of its concept_synonym entries. Only returns standard,
+    valid condition concepts from SNOMED vocabulary, ordered by name length (shortest first).
     Filters to SNOMED CT vocabulary to ensure compatibility across OMOP databases.
 
     Args:
-        term: Condition name to search for (case-insensitive partial match)
+        term: Condition name to search for (case-insensitive partial match, name or synonym)
         limit: Maximum number of results to return (default: 10)
+        offset: Number of matching results to skip, for paging past the first `limit` (default: 0)
 
     Returns:
         CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id, domain_id
     """
     try:
-        schema = db.cdm_schema
-        # Filter to SNOMED vocabulary only - standard vocabulary for conditions
-        query = f"""
-        SELECT concept_id, concept_name, concept_code, vocabulary_id, domain_id
-        FROM {schema}.concept
-        WHERE LOWER(concept_name) LIKE LOWER('%{term}%')
-          AND domain_id = 'Condition'
-          AND vocabulary_id = 'SNOMED'
-          AND standard_concept = 'S'
-          AND invalid_reason IS NULL
-        ORDER BY LENGTH(concept_name), concept_name
-        LIMIT {limit}
-        """
+        query = build_lookup_condition_sql(db.cdm_schema, term, limit, offset)
         logger.info(f"Looking up condition: {term}")
         result = db.read_query(query)
         logger.info(f"Condition lookup completed for: {term}")
@@ -547,6 +611,95 @@ def lookup_condition(term: str, limit: int = 10) -> mcp.types.CallToolResult:
             content=[
                 mcp.types.TextContent(
                     type="text", text=f"Failed to lookup condition: {str(e)}"
+                )
+            ],
+        )
+
+
+@mcp_app.tool(
+    name="Lookup_Concept",
+    description=(
+        "Look up concepts by name (or synonym) in the OMOP concept table for a "
+        "caller-supplied domain (procedure, measurement, or observation -- use "
+        "Lookup_Drug/Lookup_Condition for drug/condition instead). Returns standardized "
+        "concepts with concept_id, concept_name, concept_code, vocabulary_id, and domain_id."
+    ),
+)
+@capture_context(tool_name="Lookup_Concept")
+def lookup_concept(
+    term: str, domain: str, vocabulary_id: str | None = None, limit: int = 10, offset: int = 0
+) -> mcp.types.CallToolResult:
+    """Look up concepts by name for a given OMOP domain.
+
+    Generalizes `lookup_drug`/`lookup_condition` to the domains that don't
+    have one single canonical OMOP standard vocabulary, so `vocabulary_id`
+    here is optional (filtered only when supplied) rather than hardcoded --
+    when left unset, results are ordered by vocabulary_id first so concepts
+    from the same vocabulary group together instead of interleaving.
+
+    Args:
+        term: Concept name to search for (case-insensitive partial match, name or synonym)
+        domain: One of "procedure", "measurement", "observation"
+        vocabulary_id: Optional OMOP vocabulary_id filter (e.g. "LOINC")
+        limit: Maximum number of results to return (default: 10)
+        offset: Number of matching results to skip, for paging past the first `limit` (default: 0)
+
+    Returns:
+        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id, domain_id
+    """
+    try:
+        query = build_lookup_concept_sql(db.cdm_schema, term, domain, vocabulary_id, limit, offset)
+        logger.info(f"Looking up concept: {term} (domain={domain})")
+        result = db.read_query(query)
+        logger.info(f"Concept lookup completed for: {term}")
+        return mcp.types.CallToolResult(
+            content=[mcp.types.TextContent(type="text", text=result)]
+        )
+    except Exception as e:
+        logger.error(f"Failed to lookup concept '{term}' (domain={domain}): {e}")
+        return mcp.types.CallToolResult(
+            isError=True,
+            content=[
+                mcp.types.TextContent(
+                    type="text", text=f"Failed to lookup concept: {str(e)}"
+                )
+            ],
+        )
+
+
+@mcp_app.tool(
+    name="Get_Concepts_By_Id",
+    description=(
+        "Look up OMOP concepts by concept_id (not a name search -- use "
+        "Lookup_Drug/Lookup_Condition/Lookup_Concept for that). Returns "
+        "concept_id, concept_name, concept_code, vocabulary_id, and "
+        "domain_id for each id found."
+    ),
+)
+@capture_context(tool_name="Get_Concepts_By_Id")
+def get_concepts_by_id(concept_ids: list[int]) -> mcp.types.CallToolResult:
+    """Look up concepts by concept_id.
+
+    Args:
+        concept_ids: One or more OMOP concept_id values to look up.
+
+    Returns:
+        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id, domain_id
+    """
+    try:
+        query = build_concepts_by_id_sql(db.cdm_schema, tuple(concept_ids))
+        logger.info(f"Looking up concepts by id: {concept_ids}")
+        result = db.read_query(query)
+        return mcp.types.CallToolResult(
+            content=[mcp.types.TextContent(type="text", text=result)]
+        )
+    except Exception as e:
+        logger.error(f"Failed to lookup concepts by id {concept_ids}: {e}")
+        return mcp.types.CallToolResult(
+            isError=True,
+            content=[
+                mcp.types.TextContent(
+                    type="text", text=f"Failed to lookup concepts by id: {str(e)}"
                 )
             ],
         )
