@@ -27,6 +27,14 @@ from omcp.concept_lookup import (
     build_lookup_drug_sql,
 )
 
+
+def _has_data_rows(csv_text: str) -> bool:
+    """True if a `db.read_query` CSV response has at least one data row
+    beyond the header (pandas' `to_csv` always writes the header even for
+    an empty result), used to decide whether a name-search lookup should
+    retry with `fuzzy=True`."""
+    return len(csv_text.strip("\n").splitlines()) > 1
+
 # OpenTelemetry context propagation
 from opentelemetry.propagate import extract
 from opentelemetry import context as otel_context_api
@@ -543,9 +551,12 @@ def lookup_drug(term: str, limit: int = 10, offset: int = 0) -> mcp.types.CallTo
 
     This function searches for drug concepts in the OMOP concept table by partial match on
     the concept's own name or any of its concept_synonym entries (abbreviations, alternate
-    names). Only returns standard, valid drug concepts from RxNorm vocabulary, ordered by
-    name length (shortest first). Excludes non-standard vocabularies like RxNorm Extension
-    to ensure compatibility.
+    names). Only returns standard, valid drug concepts from RxNorm vocabulary, ranked by
+    edit distance to `term` (closest match first). Excludes non-standard vocabularies like
+    RxNorm Extension to ensure compatibility. If the first page (offset=0) has no
+    substring/synonym match at all, automatically retries with a length-scaled fuzzy
+    (edit-distance) match, so a typo or unlisted abbreviation still returns candidates
+    instead of an empty result.
 
     Args:
         term: Drug name to search for (case-insensitive partial match, name or synonym)
@@ -553,12 +564,16 @@ def lookup_drug(term: str, limit: int = 10, offset: int = 0) -> mcp.types.CallTo
         offset: Number of matching results to skip, for paging past the first `limit` (default: 0)
 
     Returns:
-        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id, domain_id
+        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id,
+        domain_id, name_edit_distance
     """
     try:
         query = build_lookup_drug_sql(db.cdm_schema, term, limit, offset)
         logger.info(f"Looking up drug: {term}")
         result = db.read_query(query)
+        if offset == 0 and not _has_data_rows(result):
+            logger.info(f"No substring/synonym match for drug '{term}', retrying fuzzy")
+            result = db.read_query(build_lookup_drug_sql(db.cdm_schema, term, limit, offset, fuzzy=True))
         logger.info(f"Drug lookup completed for: {term}")
         return mcp.types.CallToolResult(
             content=[mcp.types.TextContent(type="text", text=result)]
@@ -585,8 +600,11 @@ def lookup_condition(term: str, limit: int = 10, offset: int = 0) -> mcp.types.C
 
     This function searches for condition concepts in the OMOP concept table by partial match
     on the concept's own name or any of its concept_synonym entries. Only returns standard,
-    valid condition concepts from SNOMED vocabulary, ordered by name length (shortest first).
-    Filters to SNOMED CT vocabulary to ensure compatibility across OMOP databases.
+    valid condition concepts from SNOMED vocabulary, ranked by edit distance to `term`
+    (closest match first). Filters to SNOMED CT vocabulary to ensure compatibility across
+    OMOP databases. If the first page (offset=0) has no substring/synonym match at all,
+    automatically retries with a length-scaled fuzzy (edit-distance) match, so a typo or
+    unlisted abbreviation still returns candidates instead of an empty result.
 
     Args:
         term: Condition name to search for (case-insensitive partial match, name or synonym)
@@ -594,12 +612,16 @@ def lookup_condition(term: str, limit: int = 10, offset: int = 0) -> mcp.types.C
         offset: Number of matching results to skip, for paging past the first `limit` (default: 0)
 
     Returns:
-        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id, domain_id
+        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id,
+        domain_id, name_edit_distance
     """
     try:
         query = build_lookup_condition_sql(db.cdm_schema, term, limit, offset)
         logger.info(f"Looking up condition: {term}")
         result = db.read_query(query)
+        if offset == 0 and not _has_data_rows(result):
+            logger.info(f"No substring/synonym match for condition '{term}', retrying fuzzy")
+            result = db.read_query(build_lookup_condition_sql(db.cdm_schema, term, limit, offset, fuzzy=True))
         logger.info(f"Condition lookup completed for: {term}")
         return mcp.types.CallToolResult(
             content=[mcp.types.TextContent(type="text", text=result)]
@@ -634,8 +656,13 @@ def lookup_concept(
     Generalizes `lookup_drug`/`lookup_condition` to the domains that don't
     have one single canonical OMOP standard vocabulary, so `vocabulary_id`
     here is optional (filtered only when supplied) rather than hardcoded --
-    when left unset, results are ordered by vocabulary_id first so concepts
-    from the same vocabulary group together instead of interleaving.
+    when left unset, results are ordered by vocabulary_id first, then by
+    edit distance to `term` (closest match first), so concepts from the
+    same vocabulary group together instead of interleaving. If the first
+    page (offset=0) has no substring/synonym match at all, automatically
+    retries with a length-scaled fuzzy (edit-distance) match, so a typo or
+    unlisted abbreviation still returns candidates instead of an empty
+    result.
 
     Args:
         term: Concept name to search for (case-insensitive partial match, name or synonym)
@@ -645,12 +672,18 @@ def lookup_concept(
         offset: Number of matching results to skip, for paging past the first `limit` (default: 0)
 
     Returns:
-        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id, domain_id
+        CSV formatted results with: concept_id, concept_name, concept_code, vocabulary_id,
+        domain_id, name_edit_distance
     """
     try:
         query = build_lookup_concept_sql(db.cdm_schema, term, domain, vocabulary_id, limit, offset)
         logger.info(f"Looking up concept: {term} (domain={domain})")
         result = db.read_query(query)
+        if offset == 0 and not _has_data_rows(result):
+            logger.info(f"No substring/synonym match for concept '{term}' (domain={domain}), retrying fuzzy")
+            result = db.read_query(
+                build_lookup_concept_sql(db.cdm_schema, term, domain, vocabulary_id, limit, offset, fuzzy=True)
+            )
         logger.info(f"Concept lookup completed for: {term}")
         return mcp.types.CallToolResult(
             content=[mcp.types.TextContent(type="text", text=result)]

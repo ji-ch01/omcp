@@ -11,6 +11,22 @@ The SQL-building logic lives here, separate from the `@mcp_app.tool`-decorated
 function in `main.py`, so it can be unit-tested without a live database
 connection -- the same split `governance.py` already uses for
 `authorize_causal_operation`.
+
+Every name-search query now also computes a `name_edit_distance` column
+(Levenshtein distance between the search term and each candidate's own
+`concept_name`, via BigQuery GoogleSQL's built-in `EDIT_DISTANCE`) and orders
+by it, replacing plain shortest-name-first ordering with an actual relevance
+signal: a near-exact match is ranked first regardless of how long its name
+is. Callers may additionally opt into `fuzzy=True`, meant to be tried only
+after a plain call returns zero rows: it widens the match to also accept
+concepts whose name is within a length-scaled edit-distance tolerance of the
+term, even with no literal substring in common -- catching typos and
+abbreviations not recorded in `concept_synonym`. The tolerance follows the
+same length-scaled convention Elasticsearch/Lucene document for their "AUTO"
+fuzziness (grounded in Levenshtein automata; see Schulz, K. & Mihov, S.
+(2002). Fast String Correction with Levenshtein Automata): 0 for terms under
+3 characters, 1 under 6, 2 otherwise -- a short term can't absorb an edit
+without changing meaning, so it is never fuzzy-matched.
 """
 
 from __future__ import annotations
@@ -34,6 +50,19 @@ def _escape_term(term: str) -> str:
     return term.replace("'", "''")
 
 
+def _fuzzy_threshold(term: str) -> int:
+    """Length-scaled edit-distance tolerance for `fuzzy=True` lookups (see
+    module docstring for the Elasticsearch/Lucene "AUTO" precedent). Kept as
+    a small pure function so its bucket boundaries are independently
+    testable."""
+    length = len(term)
+    if length < 3:
+        return 0
+    if length < 6:
+        return 1
+    return 2
+
+
 def _name_or_synonym_match_sql(
     schema: str,
     escaped_term: str,
@@ -41,6 +70,7 @@ def _name_or_synonym_match_sql(
     order_by: str,
     limit: int,
     offset: int,
+    fuzzy: bool = False,
 ) -> str:
     """Shared query shape for every name-search lookup tool: match either a
     concept's own name or any of its `concept_synonym` rows (abbreviations,
@@ -48,14 +78,27 @@ def _name_or_synonym_match_sql(
     deduplicated since a concept with several matching synonyms would
     otherwise come back more than once. `LIMIT`/`OFFSET` let a caller page
     through results instead of being stuck with only the first `limit`.
+
+    Also computes `name_edit_distance` (Levenshtein distance from `term` to
+    the concept's own name) for ranking, and -- when `fuzzy` is true --
+    widens the match to accept names within a length-scaled edit-distance
+    tolerance even without a literal substring match (see module docstring).
     """
+    fuzzy_clause = ""
+    if fuzzy:
+        threshold = _fuzzy_threshold(escaped_term)
+        fuzzy_clause = (
+            f"\n            OR EDIT_DISTANCE(LOWER(c.concept_name), LOWER('{escaped_term}'), "
+            f"max_distance => {threshold}) <= {threshold}"
+        )
     return f"""
-        SELECT DISTINCT c.concept_id, c.concept_name, c.concept_code, c.vocabulary_id, c.domain_id
+        SELECT DISTINCT c.concept_id, c.concept_name, c.concept_code, c.vocabulary_id, c.domain_id,
+               EDIT_DISTANCE(LOWER(c.concept_name), LOWER('{escaped_term}')) AS name_edit_distance
         FROM {schema}.concept c
         LEFT JOIN {schema}.concept_synonym cs ON cs.concept_id = c.concept_id
         WHERE (
             LOWER(c.concept_name) LIKE LOWER('%{escaped_term}%')
-            OR LOWER(cs.concept_synonym_name) LIKE LOWER('%{escaped_term}%')
+            OR LOWER(cs.concept_synonym_name) LIKE LOWER('%{escaped_term}%'){fuzzy_clause}
           )
           AND c.standard_concept = 'S'
           AND c.invalid_reason IS NULL
@@ -72,19 +115,22 @@ def build_lookup_concept_sql(
     vocabulary_id: str | None = None,
     limit: int = 10,
     offset: int = 0,
+    fuzzy: bool = False,
 ) -> str:
     """Build the same shape of query `Lookup_Drug`/`Lookup_Condition` already
     use (case-insensitive partial match on name or synonym, standard/valid
-    concepts only, shortest-name-first), generalized to a caller-supplied
+    concepts only, ranked by relevance), generalized to a caller-supplied
     domain.
 
     `domain`/`vocabulary_id` are validated against fixed allow-lists (never
     interpolated freely) since they end up directly in the SQL string;
     `term` is quote-escaped for the same reason. Results are ordered by
-    `vocabulary_id` first (then name length) so that, when `vocabulary_id`
-    is left unset and results genuinely mix vocabularies (e.g. LOINC and
-    SNOMED both matching for a measurement), same-vocabulary concepts group
-    together instead of interleaving -- easier for a reviewer to scan.
+    `vocabulary_id` first (then edit distance, then name length) so that,
+    when `vocabulary_id` is left unset and results genuinely mix
+    vocabularies (e.g. LOINC and SNOMED both matching for a measurement),
+    same-vocabulary concepts group together instead of interleaving --
+    easier for a reviewer to scan. `fuzzy` is documented on
+    `_name_or_synonym_match_sql`.
     """
     if domain not in DOMAIN_IDS:
         raise ValueError(f"domain must be one of {tuple(DOMAIN_IDS)}")
@@ -96,37 +142,42 @@ def build_lookup_concept_sql(
     return _name_or_synonym_match_sql(
         schema, escaped_term,
         where_extra=f"AND c.domain_id = '{domain_id}' {vocabulary_clause}",
-        order_by="c.vocabulary_id, LENGTH(c.concept_name), c.concept_name",
-        limit=limit, offset=offset,
+        order_by="c.vocabulary_id, name_edit_distance, LENGTH(c.concept_name), c.concept_name",
+        limit=limit, offset=offset, fuzzy=fuzzy,
     )
 
 
-def build_lookup_drug_sql(schema: str, term: str, limit: int = 10, offset: int = 0) -> str:
+def build_lookup_drug_sql(
+    schema: str, term: str, limit: int = 10, offset: int = 0, fuzzy: bool = False,
+) -> str:
     """Build the same query `Lookup_Drug` already returns (RxNorm standard
-    drug concepts, now also matched by synonym -- see
+    drug concepts, matched by synonym and ranked by edit distance -- see
     `_name_or_synonym_match_sql`), with `term` quote-escaped -- it was
     previously interpolated unescaped into the LIKE clause, a
     SQL-injection-shaped bug fixed here the same way `build_lookup_concept_sql`
-    already handles it."""
+    already handles it. `fuzzy` is documented on `_name_or_synonym_match_sql`."""
     escaped_term = _escape_term(term)
     return _name_or_synonym_match_sql(
         schema, escaped_term,
         where_extra="AND c.domain_id = 'Drug' AND c.vocabulary_id = 'RxNorm'",
-        order_by="LENGTH(c.concept_name), c.concept_name",
-        limit=limit, offset=offset,
+        order_by="name_edit_distance, LENGTH(c.concept_name), c.concept_name",
+        limit=limit, offset=offset, fuzzy=fuzzy,
     )
 
 
-def build_lookup_condition_sql(schema: str, term: str, limit: int = 10, offset: int = 0) -> str:
+def build_lookup_condition_sql(
+    schema: str, term: str, limit: int = 10, offset: int = 0, fuzzy: bool = False,
+) -> str:
     """Build the same query `Lookup_Condition` already returns (SNOMED
-    standard condition concepts, now also matched by synonym), with `term`
-    quote-escaped -- see `build_lookup_drug_sql`."""
+    standard condition concepts, matched by synonym and ranked by edit
+    distance), with `term` quote-escaped -- see `build_lookup_drug_sql`.
+    `fuzzy` is documented on `_name_or_synonym_match_sql`."""
     escaped_term = _escape_term(term)
     return _name_or_synonym_match_sql(
         schema, escaped_term,
         where_extra="AND c.domain_id = 'Condition' AND c.vocabulary_id = 'SNOMED'",
-        order_by="LENGTH(c.concept_name), c.concept_name",
-        limit=limit, offset=offset,
+        order_by="name_edit_distance, LENGTH(c.concept_name), c.concept_name",
+        limit=limit, offset=offset, fuzzy=fuzzy,
     )
 
 

@@ -1,6 +1,7 @@
 import unittest
 
 from omcp.concept_lookup import (
+    _fuzzy_threshold,
     build_concepts_by_id_sql,
     build_lookup_concept_sql,
     build_lookup_condition_sql,
@@ -26,9 +27,26 @@ class BuildLookupConceptSqlTests(unittest.TestCase):
         self.assertIn("LOWER(cs.concept_synonym_name) LIKE LOWER('%sofa score%')", sql)
         self.assertIn("SELECT DISTINCT", sql)
 
-    def test_orders_by_vocabulary_first_so_mixed_results_group_together(self):
+    def test_orders_by_vocabulary_then_relevance_so_mixed_results_group_together(self):
         sql = build_lookup_concept_sql("base", "creatinine", "measurement")
-        self.assertIn("ORDER BY c.vocabulary_id, LENGTH(c.concept_name), c.concept_name", sql)
+        self.assertIn(
+            "ORDER BY c.vocabulary_id, name_edit_distance, LENGTH(c.concept_name), c.concept_name", sql
+        )
+
+    def test_computes_a_name_edit_distance_ranking_column(self):
+        sql = build_lookup_concept_sql("base", "creatinine", "measurement")
+        self.assertIn(
+            "EDIT_DISTANCE(LOWER(c.concept_name), LOWER('creatinine')) AS name_edit_distance", sql
+        )
+
+    def test_fuzzy_widens_the_match_without_dropping_the_substring_match(self):
+        precise = build_lookup_concept_sql("base", "creatinine", "measurement")
+        fuzzy = build_lookup_concept_sql("base", "creatinine", "measurement", fuzzy=True)
+        self.assertNotIn("EDIT_DISTANCE(LOWER(c.concept_name), LOWER('creatinine'), max_distance", precise)
+        self.assertIn(
+            "OR EDIT_DISTANCE(LOWER(c.concept_name), LOWER('creatinine'), max_distance => 2) <= 2", fuzzy
+        )
+        self.assertIn("LOWER(c.concept_name) LIKE LOWER('%creatinine%')", fuzzy)
 
     def test_vocabulary_filter_is_applied_only_when_given(self):
         without = build_lookup_concept_sql("base", "creatinine", "measurement")
@@ -73,6 +91,23 @@ class BuildLookupDrugSqlTests(unittest.TestCase):
         self.assertIn("c.invalid_reason IS NULL", sql)
         self.assertIn("LIMIT 10 OFFSET 0", sql)
 
+    def test_ranks_by_edit_distance_before_name_length(self):
+        sql = build_lookup_drug_sql("base", "albumin")
+        self.assertIn(
+            "EDIT_DISTANCE(LOWER(c.concept_name), LOWER('albumin')) AS name_edit_distance", sql
+        )
+        self.assertIn("ORDER BY name_edit_distance, LENGTH(c.concept_name), c.concept_name", sql)
+
+    def test_fuzzy_defaults_to_off(self):
+        sql = build_lookup_drug_sql("base", "albumin")
+        self.assertNotIn("max_distance", sql)
+
+    def test_fuzzy_adds_a_length_scaled_edit_distance_fallback(self):
+        sql = build_lookup_drug_sql("base", "albumin", fuzzy=True)
+        self.assertIn(
+            "OR EDIT_DISTANCE(LOWER(c.concept_name), LOWER('albumin'), max_distance => 2) <= 2", sql
+        )
+
     def test_matches_by_synonym_as_well_as_name(self):
         sql = build_lookup_drug_sql("base", "albumin")
         self.assertIn("LEFT JOIN base.concept_synonym cs ON cs.concept_id = c.concept_id", sql)
@@ -107,6 +142,19 @@ class BuildLookupConditionSqlTests(unittest.TestCase):
         self.assertIn("c.invalid_reason IS NULL", sql)
         self.assertIn("LIMIT 10 OFFSET 0", sql)
 
+    def test_ranks_by_edit_distance_before_name_length(self):
+        sql = build_lookup_condition_sql("base", "sepsis")
+        self.assertIn(
+            "EDIT_DISTANCE(LOWER(c.concept_name), LOWER('sepsis')) AS name_edit_distance", sql
+        )
+        self.assertIn("ORDER BY name_edit_distance, LENGTH(c.concept_name), c.concept_name", sql)
+
+    def test_fuzzy_adds_a_length_scaled_edit_distance_fallback(self):
+        sql = build_lookup_condition_sql("base", "flu", fuzzy=True)
+        self.assertIn(
+            "OR EDIT_DISTANCE(LOWER(c.concept_name), LOWER('flu'), max_distance => 1) <= 1", sql
+        )
+
     def test_matches_by_synonym_as_well_as_name(self):
         sql = build_lookup_condition_sql("base", "sepsis")
         self.assertIn("LEFT JOIN base.concept_synonym cs ON cs.concept_id = c.concept_id", sql)
@@ -124,6 +172,24 @@ class BuildLookupConditionSqlTests(unittest.TestCase):
     def test_offset_pages_past_the_first_results(self):
         sql = build_lookup_condition_sql("base", "sepsis", limit=10, offset=10)
         self.assertIn("LIMIT 10 OFFSET 10", sql)
+
+
+class FuzzyThresholdTests(unittest.TestCase):
+    """Boundaries of the length-scaled tolerance documented in
+    `concept_lookup`'s module docstring (Elasticsearch/Lucene "AUTO"
+    fuzziness convention)."""
+
+    def test_short_terms_get_zero_tolerance(self):
+        self.assertEqual(_fuzzy_threshold(""), 0)
+        self.assertEqual(_fuzzy_threshold("ab"), 0)
+
+    def test_medium_terms_get_one_edit_of_tolerance(self):
+        self.assertEqual(_fuzzy_threshold("abc"), 1)
+        self.assertEqual(_fuzzy_threshold("abcde"), 1)
+
+    def test_long_terms_get_two_edits_of_tolerance(self):
+        self.assertEqual(_fuzzy_threshold("abcdef"), 2)
+        self.assertEqual(_fuzzy_threshold("albumin"), 2)
 
 
 class BuildConceptsByIdSqlTests(unittest.TestCase):
