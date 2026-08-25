@@ -221,8 +221,23 @@ class SQLValidator:
             return []  # System queries are always allowed
 
         try:
-            # Parse the SQL query
-            parsed_sql = sg.parse_one(sql, read=self.from_dialect)
+            # Parse the *entire* input as a list of statements, not just the
+            # first one. sg.parse_one() silently discards everything after
+            # the first statement, so a payload like
+            # "SELECT ... ; DROP TABLE person;" would otherwise validate as
+            # a clean SELECT while the untouched original string (trailing
+            # statement included) is what actually reaches the database.
+            statements = [
+                s
+                for s in sg.parse(sql, read=self.from_dialect)
+                if s is not None and not isinstance(s, exp.Semicolon)
+            ]
+            if len(statements) != 1:
+                raise ex.NotSelectQueryError(
+                    "Only a single SELECT statement is allowed per query; "
+                    f"found {len(statements)} statements."
+                )
+            parsed_sql = statements[0]
 
             # Validate the query to ensure it's a SELECT statement
 

@@ -142,6 +142,37 @@ class TestSQLValidator:
         errors = validator.validate_sql(sql)
         assert len(errors) == 0, f"Expected no errors, got: {errors}"
 
+    def test_stacked_statement_is_rejected(self, validator):
+        """Test that a SELECT followed by a second statement is rejected,
+        even though sqlglot's parse_one() would silently keep only the
+        first (clean) SELECT statement."""
+        sql = "SELECT person_id FROM person; DROP TABLE person;"
+        errors = validator.validate_sql(sql)
+        assert len(errors) == 1, f"Expected 1 error, got: {errors}"
+        assert isinstance(errors[0], ex.NotSelectQueryError)
+
+    def test_stacked_statement_without_trailing_semicolon_is_rejected(
+        self, validator
+    ):
+        """Test statement stacking is rejected even without a trailing semicolon."""
+        sql = "SELECT person_id FROM person; DELETE FROM person"
+        errors = validator.validate_sql(sql)
+        assert len(errors) == 1, f"Expected 1 error, got: {errors}"
+        assert isinstance(errors[0], ex.NotSelectQueryError)
+
+    def test_trailing_semicolon_is_allowed(self, validator):
+        """Test that a single statement with a harmless trailing semicolon still validates."""
+        sql = "SELECT person_id FROM person;"
+        errors = validator.validate_sql(sql)
+        assert len(errors) == 0, f"Expected no errors, got: {errors}"
+
+    def test_trailing_comment_after_semicolon_is_allowed(self, validator):
+        """Test that a trailing comment after the closing semicolon doesn't
+        get mistaken for a second statement."""
+        sql = "SELECT person_id FROM person; -- trailing comment"
+        errors = validator.validate_sql(sql)
+        assert len(errors) == 0, f"Expected no errors, got: {errors}"
+
     def test_check_is_omop_table_ignores_multiple_ctes(self, validator):
         """Test that _check_is_omop_table ignores multiple CTEs with non-OMOP tables"""
         sql = """
