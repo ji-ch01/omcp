@@ -161,7 +161,6 @@ class SQLValidator:
             UnauthorizedColumnError: An error indicating the presence of unauthorized columns
             in the query, if any are found. Otherwise, returns None.
         """
-        print(self.exclude_columns)
         unauthorized_columns = [
             column.name.lower()
             for column in columns
