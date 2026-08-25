@@ -17,8 +17,10 @@ from typing import Any
 
 from omcp.governance import (
     CAUSAL_OPERATIONS,
+    CausalAuthorizationError,
     CausalExecutionContext,
     authorize_causal_operation,
+    verify_causal_context_signature,
 )
 from omcp.concept_lookup import (
     build_concepts_by_id_sql,
@@ -348,6 +350,13 @@ transport_type = os.environ.get("MCP_TRANSPORT", "stdio").lower()
 host = os.environ.get("MCP_HOST", "localhost")
 port = int(os.environ.get("MCP_PORT", "8080"))
 
+# Shared secret binding `causal_context` to whoever computed the readiness
+# snapshot (see `Causal_Select_Query` below). `causal.mcp_client.OMCPClient`
+# generates and passes one per spawned stdio subprocess automatically; an
+# SSE deployment must set this explicitly and share it with legitimate
+# callers, or every causal operation is refused.
+CAUSAL_CONTEXT_SECRET = os.environ.get("OMCP_CONTEXT_SECRET")
+
 # Validate transport type
 if transport_type not in ["stdio", "sse"]:
     logger.error(f"Invalid transport type: {transport_type}. Must be 'stdio' or 'sse'.")
@@ -490,6 +499,7 @@ def get_capabilities() -> dict[str, Any]:
         "causal_tools": ["Causal_Select_Query"],
         "causal_operations": list(CAUSAL_OPERATIONS),
         "causal_context_required": True,
+        "causal_context_signature_required": bool(CAUSAL_CONTEXT_SECRET),
         "read_only": db.read_only,
     }
 
@@ -510,6 +520,16 @@ def causal_read_query(
     """Execute only when the orchestrator readiness snapshot authorizes it."""
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
     try:
+        if not CAUSAL_CONTEXT_SECRET:
+            raise CausalAuthorizationError(
+                "OMCP_CONTEXT_SECRET is not configured on this server; "
+                "causal operations are disabled"
+            )
+        if not verify_causal_context_signature(causal_context, CAUSAL_CONTEXT_SECRET):
+            raise CausalAuthorizationError(
+                "causal_context signature is missing or does not match "
+                "OMCP_CONTEXT_SECRET"
+            )
         context = CausalExecutionContext.from_mapping(causal_context)
         authorize_causal_operation(operation, context)
         result = db.read_query(

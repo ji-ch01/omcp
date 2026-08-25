@@ -6,6 +6,9 @@ CausalOMOP must use the governed causal tool and provide a readiness snapshot.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -18,6 +21,48 @@ CAUSAL_OPERATIONS = (
     "causal_estimation",
 )
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
+
+# Fields the caller cannot self-assert without knowing OMCP_CONTEXT_SECRET.
+# Signing (not just shape-validating) `causal_context` closes the gap where
+# any client able to reach this tool -- e.g. over the optional SSE transport
+# -- could otherwise hand-craft {"causal_estimation_allowed": true, ...} and
+# pass `authorize_causal_operation` outright, since `from_mapping` below only
+# checks types/enums, never whether the run actually earned that state.
+SIGNED_CONTEXT_FIELDS = (
+    "run_id",
+    "study_id",
+    "mode",
+    "clinical_mapping_status",
+    "analysis_plan_status",
+    "aggregate_feasibility_allowed",
+    "analytic_dataset_build_allowed",
+    "causal_estimation_allowed",
+)
+
+
+def _canonical_context_bytes(context: Mapping[str, Any]) -> bytes:
+    ordered = {name: context[name] for name in SIGNED_CONTEXT_FIELDS}
+    return json.dumps(ordered, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sign_causal_context(context: Mapping[str, Any], secret: str) -> str:
+    """HMAC-SHA256 over the canonical readiness fields, keyed by a secret
+    shared out-of-band between whoever computed the readiness snapshot and
+    this server -- never derived from the context itself."""
+    return hmac.new(
+        secret.encode("utf-8"), _canonical_context_bytes(context), hashlib.sha256
+    ).hexdigest()
+
+
+def verify_causal_context_signature(context: Mapping[str, Any], secret: str) -> bool:
+    signature = context.get("signature")
+    if not isinstance(signature, str):
+        return False
+    try:
+        expected = sign_causal_context(context, secret)
+    except (KeyError, TypeError):
+        return False
+    return hmac.compare_digest(signature, expected)
 
 
 class CausalAuthorizationError(PermissionError):
