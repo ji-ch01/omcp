@@ -124,11 +124,21 @@ class OmopDatabase:
             connection_string
         )
 
+        # Queries are always generated in Postgres dialect (agno_fastomop's
+        # database_agent.txt only writes Postgres-style SQL, and read_query's
+        # own source_dialect default below is "postgres") and transpiled to
+        # target_dialect just before execution. The validator must parse that
+        # same source dialect -- validating with target_dialect mismatches the
+        # grammar it checks against the one that actually runs, which is
+        # harmless for duckdb (sqlglot's duckdb grammar closely mirrors
+        # postgres) but wrong in principle and unsafe for bigquery/databricks.
+        self.source_dialect = "postgres"
+
         self.sql_validator = SQLValidator(
             allow_source_value_columns=self.allow_source_value_columns,
             exclude_tables=None,
             exclude_columns=None,
-            from_dialect=self.target_dialect,
+            from_dialect=self.source_dialect,
         )
         self.cdm_schema = cdm_schema
         self.vocab_schema = vocab_schema
@@ -362,7 +372,7 @@ class OmopDatabase:
                     allow_source_value_columns=True,
                     exclude_tables=self.sql_validator.exclude_tables,
                     exclude_columns=self.sql_validator.exclude_columns,
-                    from_dialect=self.target_dialect,
+                    from_dialect=source_dialect,
                 )
             errors = validator.validate_sql(query)
 
